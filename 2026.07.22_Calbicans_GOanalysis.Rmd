@@ -1,0 +1,418 @@
+---
+title: "Gene Ontology Enrichment Analysis for C. albicans Infection Time Course"
+author: "M. LeGro"
+date: "2026-07-22"
+output:
+  html_document:
+    highlight: tango
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    number_sections: yes
+    toc: yes
+  word_document:
+    toc: yes
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+After the differential expression analysis with limma-voom (each infected time point -- 6hpi, 1dpi, 3dpi, 5dpi, 7dpi -- contrasted against uninfected Controls), GO terms are mapped to the gene rankings to look at pathway-level expression as a whole. This uses the same clusterProfiler-based pipeline developed for the Rad51(RNAi) project (an update from the classic topGO pipeline used previously), for both over-representation analysis (ORA) and rank-based gene set enrichment analysis (GSEA). Since this is the same *S. mediterranea* genome/annotation used across all of these dissertation chapters, the same gene ID-to-GO mapping files are reused here rather than duplicated per project.
+
+## Analysis set up and converting gene ID and GO files to analysis-compatible files
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(clusterProfiler)
+library(GO.db)
+library(enrichplot)
+library(AnnotationDbi)
+library(ggplot2)
+
+setwd("/Volumes/PortableSSD/CA_infectionproj/")
+
+# Shared reference location (same genome/annotation/GO mapping files used across the
+# PTEN, Rad51, and this project) rather than a copy kept in each project's own folder.
+reference_dir <- "/Volumes/PortableSSD/Rad51/"
+
+de_analysis_date <- "2026.07.21"   # date used when the DE analysis Rmd wrote its toptable CSVs -- update if yours differs
+go_analysis_date <- "2026.07.22"   # date label for this GO analysis's own output files
+
+timepoints <- c("6hpi", "1dpi", "3dpi", "5dpi", "7dpi")
+
+# Import the GO-to-gene ID files (unchanged from the Rad51 pipeline -- these describe
+# the genome/annotation, not any particular RNAi or infection experiment)
+file_map_simple <- read.delim(file.path(reference_dir, "2018.5.7_geneID2GO.txt"))  # 2-col file: Contig [tab] Goterm
+file_map_rich   <- read.delim(file.path(reference_dir, "GOterms_dd_Smed_v6.txt"))
+
+# Helper: normalize names to lowercase, underscores, no punctuation
+clean_names <- function(x) tolower(gsub("[^a-z0-9]+", "_", trimws(x)))
+
+# --- SIMPLE MAP ---
+map_simple <- file_map_simple
+names(map_simple) <- clean_names(names(map_simple))
+
+# --- RICH MAP ---
+map_rich <- file_map_rich
+names(map_rich) <- clean_names(names(map_rich))
+names(map_rich) <- c("Contig", "Goterm", "GO_name", "GO_desc")
+
+# --- Clean values ---
+clean_go_id <- function(x) {
+  x <- toupper(trimws(x))
+  x
+}
+
+map_rich <- map_rich |>
+  mutate(Contig = trimws(Contig),
+         Goterm = clean_go_id(Goterm),
+         GO_name = trimws(GO_name),
+         GO_desc = trimws(GO_desc)) |>
+  filter(Contig != "", Goterm != "") |>
+  distinct()
+
+# --- Build TERM2GENE & TERM2NAME ---
+term2gene <- data.frame(term = file_map_simple$Goterm, gene = file_map_simple$Contig, stringsAsFactors = FALSE)
+
+# TERM2NAME (pretty labels)
+u_terms <- unique(term2gene$term)
+ann <- AnnotationDbi::select(GO.db, keys = u_terms, columns = "TERM", keytype = "GOID")
+term2name <- data.frame(term = ann$GOID, name = ann$TERM, stringsAsFactors = FALSE)
+
+na_idx <- is.na(term2name$name)
+term2name$name[na_idx] <- term2name$term[na_idx]
+
+# confirm structure
+stopifnot(all(c("term", "gene") %in% names(term2gene)))
+stopifnot(all(grepl("^GO:\\d+$", term2gene$term)))
+cat("Unique contigs:", length(unique(term2gene$gene)),
+    " Unique GO terms:", length(unique(term2gene$term)),
+    " Duplicated rows (should be 0):", sum(duplicated(term2gene)), "\n")
+
+# create BP-only mappings
+u_terms <- unique(term2gene$term)
+ann     <- AnnotationDbi::select(GO.db, keys = u_terms, columns = "ONTOLOGY", keytype = "GOID")
+term2ont <- data.frame(term = ann$GOID, ontology = ann$ONTOLOGY, stringsAsFactors = FALSE)
+
+keep_bp <- term2ont$term[term2ont$ontology == "BP"]
+
+term2gene_bp <- subset(term2gene, term %in% keep_bp)
+term2name_bp <- subset(term2name, term %in% keep_bp)
+
+# Sanity check
+cat("BP pairs:", nrow(term2gene_bp),
+    " unique genes:", length(unique(term2gene_bp$gene)),
+    " terms in term2gene_bp:", length(unique(term2gene_bp$term)),
+    " terms in term2name_bp:", nrow(term2name_bp), "\n")
+
+# Make sure names and mappings reference the same set of BP terms
+terms_common <- intersect(unique(term2gene_bp$term), unique(term2name_bp$term))
+
+term2gene_bp <- subset(term2gene_bp, term %in% terms_common)
+term2name_bp <- subset(term2name_bp, term %in% terms_common)
+
+# Gene-set size distribution
+summary(as.integer(table(term2gene_bp$term)))
+```
+
+## Import differential expression results
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+# One topTable CSV per time point, produced by the DE analysis Rmd -- read in a loop
+# rather than as five separately-named objects, since the same processing applies to
+# each one regardless of which contrast it is.
+toptable_files <- setNames(
+  paste0(de_analysis_date, "_Calbicans_toptable_", timepoints, "-Control.csv"),
+  timepoints
+)
+
+de_results <- lapply(toptable_files, function(f) {
+  df <- read.csv(f, stringsAsFactors = FALSE)
+  names(df)[names(df) == "X"] <- "GeneID"   # write.csv() default row.names column
+  df
+})
+
+# Auto-detect column names once per contrast instead of retyping the same five
+# detection lines for every comparison.
+detect_col <- function(df, candidates) {
+  match <- candidates[candidates %in% names(df)]
+  if (length(match) == 0) NA_character_ else match[1]
+}
+
+col_map <- lapply(de_results, function(df) {
+  list(
+    id   = detect_col(df, c("GeneID", "ID", "Contig", "Gene")),
+    t    = detect_col(df, c("t", "T")),
+    padj = detect_col(df, c("adj.P.Val", "adj.P.Val.", "adj_p_val", "adjP")),
+    p    = detect_col(df, c("P.Value", "PValue", "pvalue", "P.Val")),
+    lfc  = detect_col(df, c("logFC", "log2FoldChange", "LogFC"))
+  )
+})
+```
+
+## Define the universe and differentially expressed gene lists per time point
+
+The universe for each time point is all genes tested in that contrast that also exist in the GO mapping. Significant genes are called at FDR <= 0.05 and split into up/down by the sign of logFC. These numbers are calculated directly from the data below (via `cat()`), rather than typed into the prose, so they can't go stale if the input data changes.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+fdr_cut <- 0.05
+
+sig_lists <- lapply(timepoints, function(tp) {
+  df <- de_results[[tp]]
+  cm <- col_map[[tp]]
+  df[[cm$id]] <- trimws(df[[cm$id]])
+
+  universe_all <- unique(df[[cm$id]])
+  universe     <- intersect(universe_all, unique(term2gene_bp$gene))
+
+  adjOK   <- df[[cm$padj]] <= fdr_cut
+  sig_all <- unique(df[[cm$id]][adjOK])
+
+  if (!is.na(cm$lfc)) {
+    sig_up   <- unique(df[[cm$id]][adjOK & df[[cm$lfc]] > 0])
+    sig_down <- unique(df[[cm$id]][adjOK & df[[cm$lfc]] < 0])
+  } else {
+    sig_up <- sig_down <- character(0)
+  }
+
+  cat(tp, "vs Control -- Universe size:", length(universe),
+      " Sig total:", length(sig_all),
+      " (Up:", length(sig_up), " Down:", length(sig_down), ")\n")
+
+  list(universe = universe, all = sig_all, up = sig_up, down = sig_down)
+})
+names(sig_lists) <- timepoints
+```
+
+## Over-Representation Analysis (ORA) with clusterProfiler
+
+For ORA, differentially expressed genes (FDR <= 0.05) at each time point are supplied to `clusterProfiler::enricher`, using the custom gene-to-GO mapping (TERM2GENE) built above, with the background restricted to all genes tested in that contrast.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+run_ora <- function(gene_vec, t2g, t2n, universe) {
+  if (length(gene_vec) == 0) return(NULL)
+  enricher(
+    gene          = intersect(gene_vec, universe),
+    universe      = universe,
+    TERM2GENE     = t2g,
+    TERM2NAME     = t2n,
+    pAdjustMethod = "BH",
+    qvalueCutoff  = 0.05,
+    pvalueCutoff  = 0.05,
+    minGSSize     = 5,
+    maxGSSize     = 1000
+  )
+}
+
+ora_results <- lapply(timepoints, function(tp) {
+  universe <- sig_lists[[tp]]$universe
+  t2g_use  <- subset(term2gene_bp, gene %in% universe)
+  t2n_use  <- subset(term2name_bp, term %in% unique(t2g_use$term))
+
+  list(
+    all  = run_ora(sig_lists[[tp]]$all,  t2g_use, t2n_use, universe),
+    up   = run_ora(sig_lists[[tp]]$up,   t2g_use, t2n_use, universe),
+    down = run_ora(sig_lists[[tp]]$down, t2g_use, t2n_use, universe)
+  )
+})
+names(ora_results) <- timepoints
+```
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+for (tp in timepoints) {
+  for (direction in c("all", "up", "down")) {
+    ego <- ora_results[[tp]][[direction]]
+    if (is.null(ego)) {
+      message(tp, " (", direction, "): no ORA result -- skipping.")
+      next
+    }
+
+    print(head(as.data.frame(ego)))
+
+    p_ora <- dotplot(ego, showCategory = 20) +
+      ggplot2::ggtitle(paste0("GO BP (", tp, " vs Control, ", direction, ")"))
+    print(p_ora)
+    ggsave(filename = paste0(go_analysis_date, "_Calbicans_GO_ORA_", tp, "_", direction, "_dotplot.pdf"),
+           plot = p_ora, width = 8, height = 8, units = "in")
+
+    write.table(as.data.frame(ego),
+                file = paste0(go_analysis_date, "_Calbicans_GO_ORA_", tp, "_", direction, ".tsv"),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+  }
+}
+```
+
+## Gene Set Enrichment Analysis (GSEA) and cameraPR
+
+Genes are ranked by moderated t-statistic from limma for each time point, and enrichment is computed with `clusterProfiler::GSEA` and `limma::cameraPR`, which accounts for inter-gene correlation.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+library(limma)
+
+gsea_results   <- list()
+camera_results <- list()
+
+for (tp in timepoints) {
+  cm       <- col_map[[tp]]
+  df       <- de_results[[tp]]
+  universe <- sig_lists[[tp]]$universe
+
+  tstats <- df[[cm$t]]
+  names(tstats) <- df[[cm$id]]
+  keep   <- names(tstats) %in% universe & is.finite(tstats)
+  tstats <- sort(tstats[keep], decreasing = TRUE)
+
+  t2g_use <- subset(term2gene_bp, gene %in% universe)
+  t2n_use <- subset(term2name_bp, term %in% unique(t2g_use$term))
+
+  gsea_results[[tp]] <- GSEA(
+    geneList      = tstats,
+    TERM2GENE     = t2g_use,
+    TERM2NAME     = t2n_use,
+    pAdjustMethod = "BH",
+    minGSSize     = 5,
+    maxGSSize     = 1000,
+    eps           = 0,
+    seed          = TRUE
+  )
+
+  if (nrow(gsea_results[[tp]]@result) > 0) {
+    print(head(as.data.frame(gsea_results[[tp]]@result)))
+
+    p_ridge <- ridgeplot(gsea_results[[tp]], showCategory = 20) +
+      ggplot2::ggtitle(paste0(tp, " vs Control"))
+    print(p_ridge)
+    ggsave(filename = paste0(go_analysis_date, "_Calbicans_GSEA_", tp, "_ridgeplot.pdf"),
+           plot = p_ridge, width = 8, height = 8, units = "in")
+
+    p_gsea <- gseaplot2(gsea_results[[tp]], geneSetID = gsea_results[[tp]]@result$ID[1])
+    print(p_gsea)
+    ggsave(filename = paste0(go_analysis_date, "_Calbicans_GSEA_", tp, "_gseaplot.pdf"),
+           plot = p_gsea, width = 8, height = 6, units = "in")
+
+    write.table(as.data.frame(gsea_results[[tp]]@result),
+                file = paste0(go_analysis_date, "_Calbicans_GO_GSEA_", tp, ".tsv"),
+                sep = "\t", row.names = FALSE, quote = FALSE)
+  } else {
+    message(tp, ": no GSEA results at current thresholds.")
+  }
+
+  gene_sets <- split(t2g_use$gene, t2g_use$term)
+  camera_results[[tp]] <- cameraPR(statistic = tstats, index = gene_sets)
+  print(head(camera_results[[tp]]))
+}
+```
+
+## Length-bias sensitivity analysis with goseq
+
+Per-transcript length is extracted once from the shared GTF annotation and reused across every time point, since length depends only on the annotation, not on which contrast is being tested.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+suppressPackageStartupMessages({
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(goseq)
+})
+
+gtf_path <- file.path(reference_dir, "remodeled.gtf")
+gtf <- import(gtf_path)
+
+id_field <- if ("transcript_id" %in% colnames(mcols(gtf))) "transcript_id" else {
+  f <- grep("transcript", colnames(mcols(gtf)), value = TRUE)
+  if (length(f) == 0) stop("No transcript_id-like field in GTF attributes.")
+  f[1]
+}
+
+if (!any(gtf$type == "exon")) stop("No exon features in GTF.")
+exons_all <- gtf[gtf$type == "exon"]
+
+ids       <- as.character(mcols(exons_all)[[id_field]])
+split_ex  <- split(exons_all, ids)
+tx_len_all <- vapply(split_ex, function(gr) sum(width(reduce(gr))), numeric(1))
+
+goseq_results <- list()
+
+for (tp in timepoints) {
+  # The original script reassigned its filtered ID list back to a variable literally
+  # named `universe` inside this section -- which, earlier in that script, was the
+  # name already used for the interaction-effect universe from a different comparison.
+  # That silently overwrote it. Using a loop-local name here (universe_lc) avoids
+  # that class of bug entirely.
+  universe <- sig_lists[[tp]]$universe
+  sig_all  <- sig_lists[[tp]]$all
+
+  lengths <- tx_len_all[universe]
+  names(lengths) <- universe
+
+  na_idx <- is.na(lengths)
+  if (any(na_idx) && "gene_id" %in% colnames(mcols(gtf))) {
+    gene_like <- gtf[gtf$type %in% c("gene", "mRNA", "transcript")]
+    gid       <- as.character(mcols(gene_like)[["gene_id"]])
+    gene_len  <- vapply(split(gene_like, gid), function(gr) sum(width(reduce(gr))), numeric(1))
+    miss      <- names(lengths)[na_idx]
+    lengths[miss] <- gene_len[miss]
+  }
+
+  keep <- !is.na(lengths)
+  if (any(!keep)) {
+    warning(tp, ": ", sum(!keep), " universe IDs lack lengths; dropping them for goseq.")
+  }
+  universe_lc <- universe[keep]
+  lengths_lc  <- lengths[keep]
+
+  gene_de <- as.integer(universe_lc %in% sig_all)
+  names(gene_de) <- universe_lc
+
+  t2g_use <- term2gene_bp[term2gene_bp$gene %in% universe_lc, , drop = FALSE]
+  go_map  <- split(t2g_use$gene, t2g_use$term)
+
+  cat(tp, "vs Control -- Universe:", length(universe_lc),
+      " Have lengths for:", sum(!is.na(lengths_lc)), "\n")
+
+  pwf <- nullp(gene_de, bias.data = lengths_lc, plot.fit = FALSE)
+
+  # plotPWF() is base R graphics, not a ggplot object, so ggsave() won't work on it --
+  # instead the plot is drawn twice: once into its own PDF device, once normally so it
+  # still displays inline (same approach used for the Venn diagram in the DE analysis file).
+  pwf_pdf <- paste0(go_analysis_date, "_Calbicans_goseq_PWF_", tp, ".pdf")
+  pdf(file = pwf_pdf)
+  plotPWF(pwf)
+  title(main = paste0(tp, " vs Control"))
+  dev.off()
+
+  plotPWF(pwf)
+  title(main = paste0(tp, " vs Control"))
+
+  gsq <- goseq(pwf, gene2cat = go_map, use_genes_without_cat = TRUE)
+  gsq$padj_over  <- p.adjust(gsq$over_represented_pvalue,  "BH")
+  gsq$padj_under <- p.adjust(gsq$under_represented_pvalue, "BH")
+
+  term2name_vec <- setNames(term2name_bp$name, term2name_bp$term)
+  gsq$term <- gsq$category
+  gsq$name <- unname(term2name_vec[gsq$term])
+  gsq$name[is.na(gsq$name)] <- gsq$term
+
+  gsq_out <- gsq[order(gsq$padj_over, gsq$over_represented_pvalue), ]
+  write.table(gsq_out,
+              file = paste0(go_analysis_date, "_Calbicans_goseq_BP_lengthcorrected_", tp, ".tsv"),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  goseq_results[[tp]] <- gsq_out
+  print(head(gsq_out[, c("term", "name", "numDEInCat", "numInCat", "over_represented_pvalue", "padj_over")], 20))
+}
+```
+
+## Session info and package versions
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+sessionInfo()
+installed.packages()[, c("Package", "Version")]
+write.csv(installed.packages()[, c("Package", "Version")],
+          paste0(go_analysis_date, "_installed_packages_versions.csv"), row.names = FALSE)
+```

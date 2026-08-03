@@ -1,0 +1,212 @@
+---
+title: "Aligning C. albicans Infection Timecourse Samples to the Schmidtea mediterranea Genome"
+author: "M. LeGro"
+date: "2026-07-17"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Experimental design
+
+These samples come from a bulk RNA-seq experiment (Illumina HiSeq, paired-end reads) profiling the planarian response to *Candida albicans* infection over a time course. Eighteen libraries were sequenced on a single lane (L003): three uninfected control replicates (CP1-CP3) and five infected time points post-infection with three replicates each (6 hours, 1 day, 3 days, 5 days, and 7 days). The sample naming key below was provided by Beryl Arinda; the 7dpi group (S13-S15) was corrected here after an email typo listed "S10-12" for both the 5dpi and 7dpi groups.
+
+| Sample IDs      | Condition |
+|-----------------|-----------|
+| CP1, CP2, CP3   | Control   |
+| S1, S2, S3      | 6hpi      |
+| S4, S5, S6      | 1dpi      |
+| S7, S8, S9      | 3dpi      |
+| S10, S11, S12   | 5dpi      |
+| S13, S14, S15   | 7dpi      |
+
+Reads are aligned to the same *S. mediterranea* reference genome and annotation used in the PTEN and Rad51 chapters (`SmedS2F18_WGS_wrapped.fasta`, published by the Rink lab in September 2024, and the accompanying `remodeled.gtf`), rather than the `YAIgenome.fa`/`Annotations.gff3` files that were included in Beryl's Box folder. This keeps the alignment pipeline consistent across chapters for direct comparability. The genome download and line-wrapping procedure (required because `buildindex` errors on FASTA lines longer than 1000 bytes) is documented in the 2024-10-24 PTEN alignment file and isn't repeated here since the wrapped FASTA and index already exist.
+
+## Setup and file paths
+
+Paths for locating and calling the genome reference, BAM, and sample files. 
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+knitr::opts_chunk$set(echo = TRUE)
+
+# --- EDIT THESE PATHS FOR YOUR LOCAL MACHINE ---
+fastq_dir       <- "/Volumes/PortableSSD/CA_infectionproj/"       # Beryl's Box folder, downloaded locally
+bam_dir         <- "/Volumes/PortableSSD/CA_infectionproj/BAM_alignments" # where alignment output BAMs will be written
+reference_dir   <- "/Volumes/PortableSSD/Rad51/"                    # shared reference used across PTEN/Rad51/this project
+# ------------------------------------------------
+
+reference_fasta <- file.path(reference_dir, "SmedS2F18_WGS_wrapped.fasta")
+reference_index <- file.path(reference_dir, "reference_index")
+annotation_file <- file.path(reference_dir, "remodeled.gtf")
+
+analysis_date   <- "2026.07.20"  # used to label output files; set once instead of retyping in each align() call
+
+dir.create(bam_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Sample sheet
+
+Rather than writing out 18 near-identical `align()` calls by hand, the sample metadata and file names are built into a single data frame. This also has the advantage of encoding the experimental design (condition/time point) directly alongside each sample, so it's carried through to the count matrix and QC plot automatically instead of being re-derived by hand later.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+library(Rsubread)
+
+sample_sheet <- data.frame(
+  sample_id = c("CP1", "CP2", "CP3",
+                "S1", "S2", "S3",
+                "S4", "S5", "S6",
+                "S7", "S8", "S9",
+                "S10", "S11", "S12",
+                "S13", "S14", "S15"),
+  seq_id    = c("S56", "S57", "S58",
+                "S41", "S42", "S43",
+                "S44", "S45", "S46",
+                "S47", "S48", "S49",
+                "S50", "S51", "S52",
+                "S53", "S54", "S55"),
+  condition = factor(
+    c(rep("Control", 3), rep("6hpi", 3), rep("1dpi", 3),
+      rep("3dpi", 3), rep("5dpi", 3), rep("7dpi", 3)),
+    levels = c("Control", "6hpi", "1dpi", "3dpi", "5dpi", "7dpi")
+  ),
+  stringsAsFactors = FALSE
+)
+
+sample_sheet$read1 <- file.path(fastq_dir, paste0(sample_sheet$sample_id, "_", sample_sheet$seq_id, "_L003_R1_001.fastq.gz"))
+sample_sheet$read2 <- file.path(fastq_dir, paste0(sample_sheet$sample_id, "_", sample_sheet$seq_id, "_L003_R2_001.fastq.gz"))
+sample_sheet$bam   <- file.path(bam_dir, paste0(sample_sheet$sample_id, "_alignment_", analysis_date, ".BAM"))
+
+# Confirm every expected fastq file actually exists before attempting alignment,
+# so a typo'd path fails loudly here instead of partway through an hours-long align() call
+missing_files <- c(sample_sheet$read1, sample_sheet$read2)[!file.exists(c(sample_sheet$read1, sample_sheet$read2))]
+if (length(missing_files) > 0) {
+  stop("Missing fastq files:\n", paste(missing_files, collapse = "\n"))
+}
+
+sample_sheet
+```
+
+## Building the reference index
+
+Since this same wrapped FASTA was already indexed for the PTEN and Rad51 chapters, the call below checks whether the index files already exist and skips rebuilding if so.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+if (!file.exists(paste0(reference_index, ".reads"))) {
+  buildindex(basename = reference_index, reference = reference_fasta)
+} else {
+  message("Reference index already exists at ", reference_index, " -- skipping buildindex().")
+}
+```
+
+## Aligning reads
+
+Since this is running locally and aligning one sample at a time across multiple sessions rather than all 18 at once, each iteration checks whether its output BAM already exists and skips it if so. That way the chunk can be re-run (or knit) at any point without redoing finished alignments. `nthreads` is also set explicitly since the original scripts left it at Rsubread's default of 1 thread, which is considerably slower on a local machine with multiple cores available. `align()` reads gzipped FASTQ files directly, so there's no need to decompress the `.fastq.gz` files first.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+n_threads <- 4  # adjust based on your machine's available cores, e.g. parallel::detectCores() - 1
+
+for (i in seq_len(nrow(sample_sheet))) {
+  s <- sample_sheet[i, ]
+
+  if (file.exists(s$bam)) {
+    message(s$sample_id, ": alignment already exists at ", s$bam, " -- skipping.")
+    next
+  }
+
+  message("Aligning ", s$sample_id, " (", s$condition, ")...")
+  align(
+    index       = reference_index,
+    readfile1   = s$read1,
+    readfile2   = s$read2,
+    type        = "rna",
+    output_file = s$bam,
+    nthreads    = n_threads
+  )
+}
+```
+
+*Note: `align()` was kept here (rather than switching to Rsubread's `subjunc()`, which is purpose-built for detecting exon-exon splice junctions in RNA-seq) to stay consistent with the aligner used in the PTEN and Rad51 chapters.*
+
+## Counting reads with featureCounts
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+Counts <- featureCounts(
+  files = sample_sheet$bam,
+  annot.ext = annotation_file,
+  isGTFAnnotationFile = TRUE,
+  GTF.featureType = "exon",
+  GTF.attrType = "gene_id",
+  isPairedEnd = TRUE
+)
+
+# featureCounts names count columns after the full BAM file path by default,
+# which is unwieldy downstream -- replace with the clean sample IDs from the sample sheet
+colnames(Counts$counts) <- sample_sheet$sample_id
+
+write.table(
+  x = data.frame(Counts$annotation[, c("GeneID", "Length")], Counts$counts, stringsAsFactors = FALSE),
+  file = paste0(analysis_date, "_Calbicans_counts_exonfeature.txt"),
+  quote = FALSE,
+  sep = "\t",
+  row.names = FALSE
+)
+```
+
+## Alignment summary plot
+
+Adapted from the Rad51 QC plot. The original version reordered rows with a hard-coded index (`summary_data[c(4:6, 1:3, 7:nrow(summary_data)), ]`), which silently breaks if a sample is added, removed, or the files list in a different order. This version instead joins each `.summary` file back to `sample_sheet` by sample ID, so ordering is always driven by the `condition` factor levels defined above regardless of file order on disk.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+library(tidyverse)
+
+summary_files <- list.files(path = bam_dir, pattern = "\\.summary$", full.names = TRUE)
+
+read_summary <- function(filepath) {
+  df <- read_tsv(filepath, col_names = c("Metric", "Count")) %>%
+    pivot_wider(names_from = Metric, values_from = Count)
+  df$bam_file <- sub("\\.summary$", "", basename(filepath))
+  df
+}
+
+summary_data <- map_dfr(summary_files, read_summary) %>%
+  mutate(sample_id = sample_sheet$sample_id[match(bam_file, basename(sample_sheet$bam))]) %>%
+  left_join(sample_sheet %>% select(sample_id, condition), by = "sample_id") %>%
+  arrange(condition, sample_id)
+
+summary_data$sample_id <- factor(summary_data$sample_id, levels = summary_data$sample_id)
+
+# Main figure: total vs. mapped fragments
+main_fig_data <- summary_data %>%
+  select(sample_id, Total_fragments, Mapped_fragments) %>%
+  mutate(Unmapped_fragments = Total_fragments - Mapped_fragments) %>%
+  pivot_longer(cols = c(Mapped_fragments, Unmapped_fragments),
+               names_to = "Category", values_to = "Count")
+
+ggplot(main_fig_data, aes(x = sample_id, y = Count, fill = Category)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Total vs. Mapped Fragments by Sample",
+       x = "Sample", y = "Fragment Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2")
+
+ggsave(filename = paste0(analysis_date, "_Calbicans_TotalVsMapped_barchart.pdf"),
+       plot = last_plot(), width = 10, height = 6, units = "in")
+
+# Supplemental figure: detailed fragment breakdown
+supp_fig_data <- summary_data %>%
+  select(sample_id, Total_fragments, Mapped_fragments, Uniquely_mapped_fragments,
+         Multi_mapping_fragments, Unmapped_fragments, Indels) %>%
+  pivot_longer(cols = -sample_id, names_to = "Category", values_to = "Count")
+
+ggplot(supp_fig_data, aes(x = sample_id, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Detailed Fragment Breakdown by Sample",
+       x = "Sample", y = "Fragment Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Pastel1")
+
+ggsave(filename = paste0(analysis_date, "_Calbicans_FragmentBreakdown_barchart.pdf"),
+       plot = last_plot(), width = 10, height = 6, units = "in")
+```

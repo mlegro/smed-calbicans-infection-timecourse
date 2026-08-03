@@ -1,0 +1,368 @@
+---
+title: "Differential Gene Expression Across a C. albicans Infection Time Course in Planaria"
+author: "M. LeGro"
+date: "2026-07-21"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Normalizing and filtering read counts
+
+This picks up from the alignment/`featureCounts` output produced by the alignment Rmd: 18 libraries -- three uninfected controls (CP1-CP3) and five post-infection time points (6hpi, 1dpi, 3dpi, 5dpi, 7dpi) with three replicates each. A `DGEList` is built from the raw counts, normalization factors are calculated, low-count genes are filtered (CPM > 0.5 in at least one sample), and the remaining counts are converted to counts-per-million (CPM).
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+library(tidyverse)   # includes ggplot2, dplyr, readr, etc. -- no need to also load dplyr separately
+library(limma)
+library(edgeR)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+
+setwd("/Volumes/PortableSSD/CA_infectionproj/")
+
+analysis_date <- "2026.07.21"                                             # used to label output files
+counts_file   <- "2026.07.20_Calbicans_counts_exonfeature.txt"            # written by the alignment Rmd 
+# Sample -> condition key, defined once here rather than maintained in a separate
+# hand-typed metadata file. The original PTEN script read a standalone meta.txt and
+# matched it to the counts matrix by row position; if the two files were ever in a
+# different order, samples would be silently mislabeled. Matching by sample_id below
+# (rather than trusting row order) removes that risk entirely.
+sample_metadata <- data.frame(
+  sample_id = c("CP1", "CP2", "CP3",
+                "S1", "S2", "S3",
+                "S4", "S5", "S6",
+                "S7", "S8", "S9",
+                "S10", "S11", "S12",
+                "S13", "S14", "S15"),
+  condition = factor(
+    c(rep("Control", 3), rep("6hpi", 3), rep("1dpi", 3),
+      rep("3dpi", 3), rep("5dpi", 3), rep("7dpi", 3)),
+    levels = c("Control", "6hpi", "1dpi", "3dpi", "5dpi", "7dpi")
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Import raw counts
+counts_raw <- read.delim(counts_file, row.names = 1)
+countsmat  <- as.matrix(counts_raw[, setdiff(colnames(counts_raw), "Length")])
+
+# Confirm every count column has a matching entry in the sample key, then order the
+# metadata to match the counts matrix's actual column order (not the other way around)
+stopifnot(all(colnames(countsmat) %in% sample_metadata$sample_id))
+meta_ordered <- sample_metadata[match(colnames(countsmat), sample_metadata$sample_id), ]
+meta.f <- meta_ordered$condition
+
+# Build the DGEList. Note this is NOT named `list` (as in the original PTEN script) --
+# `list` is a base R function, and overwriting it with a DGEList object would silently
+# break any later call to list() for the rest of the R session.
+dge_list <- DGEList(countsmat, group = meta.f)
+dge_list <- calcNormFactors(dge_list)
+
+# Filter out genes with less than 0.5 CPM in every sample
+keep     <- rowSums(cpm(dge_list) > 0.5) >= 1
+dge_list <- dge_list[keep, ]
+
+CPM <- cpm(dge_list$counts)
+
+write.csv(CPM, file = paste0(analysis_date, "_Calbicans_countsCPM.csv"))
+```
+
+After filtering, the dataset went from `r nrow(countsmat)` transcripts to `r nrow(dge_list)` transcripts in the CPM dataset. 
+
+## MDS plot for sample distribution
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+cols <- c("black", "red", "green", "blue", "purple", "orange")
+plotMDS(CPM, col = cols[as.numeric(meta.f)])
+```
+
+## Fitting the filtered, normalized counts to a linear model
+
+The counts are fit to a linear model with `voomWithQualityWeights` to account for sample-to-sample variation, Bayesian statistics are calculated, and each infected time point is contrasted against the Control group.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+design <- model.matrix(~0 + meta.f)
+
+# Time point labels start with a digit (6hpi, 1dpi, ...), which isn't a syntactically
+# valid R name -- make.names() prefixes those with "X" (6hpi -> X6hpi, etc.), which is
+# what makeContrasts requires of the design matrix's column names. This replaces the
+# backtick approach, which turned out not to be enough: makeContrasts validates the
+# design's column names themselves before it even parses the contrast expressions, so
+# quoting the names in the formula doesn't get around it.
+colnames(design) <- make.names(levels(meta.f))   # Control, X6hpi, X1dpi, X3dpi, X5dpi, X7dpi
+
+v    <- voomWithQualityWeights(dge_list, design = design, normalize.method = "none", plot = TRUE)
+vfit <- lmFit(v, design = design)
+vfit <- eBayes(vfit)
+
+# `levels = design` is passed here (the actual design matrix), rather than the raw
+# grouping factor as in the original script -- that's the usage limma's docs describe,
+# and it removes a fragile dependency on the factor's levels happening to match the
+# design's column names exactly.
+contrast_matrix <- makeContrasts(
+  X6hpi - Control,
+  X1dpi - Control,
+  X3dpi - Control,
+  X5dpi - Control,
+  X7dpi - Control,
+  levels = design
+)
+
+timepoints <- c("6hpi", "1dpi", "3dpi", "5dpi", "7dpi")
+colnames(contrast_matrix) <- paste0(timepoints, "_vs_Control")
+
+vfit <- contrasts.fit(vfit, contrasts = contrast_matrix)
+vfit <- eBayes(vfit)
+
+results <- decideTests(vfit)
+
+timepoints <- c("6hpi", "1dpi", "3dpi", "5dpi", "7dpi")
+
+# One topTable per contrast, built in a loop instead of five near-identical lines --
+# adding or removing a time point later only means editing the `timepoints` vector.
+toptables <- setNames(
+  lapply(seq_along(timepoints), function(i) topTable(vfit, coef = i, number = Inf, sort.by = "P")),
+  timepoints
+)
+toptable_all <- topTable(vfit, number = Inf)
+
+for (tp in timepoints) {
+  write.csv(toptables[[tp]], file = paste0(analysis_date, "_Calbicans_toptable_", tp, "-Control.csv"))
+}
+write.csv(toptable_all, file = paste0(analysis_date, "_Calbicans_toptable_allcoefs.csv"))
+```
+
+*Note: `number = Inf` is used instead of a hard-coded large number (the original used `number = 300000`, a number picked to safely exceed the transcript count) so every gene is returned regardless of dataset size.*
+
+## Calculating z-scores and merging with topTables
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+# scale() computes column-wise statistics, so the matrix is transposed to put genes in
+# columns, scaled (z-scored per gene across samples), then transposed back so genes are
+# rows and samples are columns again -- same approach as before, just commented so the
+# reason for the double-transpose is clear on a re-read.
+CPMz  <- scale(t(CPM), center = TRUE, scale = TRUE)
+CPMzt <- t(CPMz)
+
+write.csv(CPMzt, file = paste0(analysis_date, "_Calbicans_cpmzscore_all.csv"))
+
+merged <- setNames(
+  lapply(timepoints, function(tp) merge.data.frame(toptables[[tp]], CPMzt, by.x = "row.names", by.y = "row.names")),
+  timepoints
+)
+
+for (tp in timepoints) {
+  write.csv(merged[[tp]], file = paste0(analysis_date, "_Calbicans_", tp, "vControl_CPMzscores_wtoptable.csv"))
+}
+```
+
+## Sorting for significantly differentially expressed transcripts
+
+Genes are considered significant at FDR (adj. P-value) < 0.05. Within that significant set, "up" and "down" are further split by log fold-change beyond +/-1.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+# In the original script, the "UP"/"DOWN"/"BOTH" subsets were filtered only on logFC,
+# without also requiring adj.P.Val < 0.05 -- despite being named with a "_0.05" suffix.
+# That means those lists could include genes with a large fold-change but a
+# non-significant p-value. Both criteria are applied together here so the "significant"
+# label in each list's name actually reflects what's in it. Worth double-checking against
+# what you and your coauthors intend before this goes into the manuscript.
+sig <- lapply(timepoints, function(tp) {
+  df <- merged[[tp]]
+  list(
+    all  = df[df$adj.P.Val < 0.05, ],
+    up   = df[df$adj.P.Val < 0.05 & df$logFC >  1, ],
+    down = df[df$adj.P.Val < 0.05 & df$logFC < -1, ],
+    both = df[df$adj.P.Val < 0.05 & (df$logFC > 1 | df$logFC < -1), ]
+  )
+})
+names(sig) <- timepoints
+```
+
+## Removing extra z-score columns from each timepoint's table
+
+Each merged table above carries z-score columns for all 18 samples, even though a given contrast only needs the Control and matching time point samples. Columns are selected here by sample ID/condition rather than by hard-coded column position.
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+# The original script selected columns with literal indices, e.g. mergedfin[, c(3,4,5,...)].
+# That's fragile: if any upstream step changes the number or order of columns, the indices
+# silently point at the wrong data with no error. Selecting by name instead is self-documenting
+# and safe against upstream changes.
+stat_cols <- c("logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")
+
+clean_sig_table <- function(df, tp) {
+  tp_samples      <- sample_metadata$sample_id[sample_metadata$condition == tp]
+  control_samples <- sample_metadata$sample_id[sample_metadata$condition == "Control"]
+  out <- df[, c(stat_cols, control_samples, tp_samples)]
+  rownames(out) <- df$Row.names
+  out
+}
+
+for (tp in timepoints) {
+  sig[[tp]]$all  <- clean_sig_table(sig[[tp]]$all,  tp)
+  sig[[tp]]$up   <- clean_sig_table(sig[[tp]]$up,   tp)
+  sig[[tp]]$down <- clean_sig_table(sig[[tp]]$down, tp)
+  sig[[tp]]$both <- clean_sig_table(sig[[tp]]$both, tp)
+}
+
+```
+
+## Pairwise heatmaps for each time point vs. Control
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+mycolz <- colorRamp2(c(-1.0, 0, 1.0), c("purple", "white", "dark cyan"))
+
+for (tp in timepoints) {
+  df <- sig[[tp]]$all   # swap to sig[[tp]]$up / $down / $both for fold-change-thresholded versions
+
+  if (nrow(df) == 0) {
+    message(tp, ": no significant genes at FDR < 0.05 -- skipping heatmap.")
+    next
+  }
+
+  sample_cols <- setdiff(colnames(df), stat_cols)
+  mat <- as.matrix(df[, sample_cols])
+  storage.mode(mat) <- "numeric"
+  rownames(mat) <- make.unique(rownames(mat))
+
+  hm <- Heatmap(mat, name = "Z-score", col = mycolz,
+                column_title = paste0(tp, " vs Control"),
+                column_names_gp = gpar(fontsize = 8),
+                cluster_columns = FALSE, cluster_rows = TRUE)
+
+  print(hm)
+
+  pdf(paste0(analysis_date, "_Calbicans_", tp, "vControl_heatmap.pdf"), width = 6, height = 10)
+  draw(hm)
+  dev.off()
+}
+```
+
+## Finding significant genes shared across all time points
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+# The original script found genes shared across all 5 contrasts by chaining pairwise
+# merge.data.frame() calls (2 vs 3, then 4 vs 6, then combining those, then adding the
+# last one). Besides being hard to follow, repeated merges on tables that share column
+# names (logFC, adj.P.Val, etc.) produce auto-suffixed columns like "C01.x.x" that later
+# code had to carefully reconstruct. Intersecting gene IDs directly avoids that entirely.
+shared_ids <- list(
+  all  = Reduce(intersect, lapply(timepoints, function(tp) rownames(sig[[tp]]$all))),
+  up   = Reduce(intersect, lapply(timepoints, function(tp) rownames(sig[[tp]]$up))),
+  down = Reduce(intersect, lapply(timepoints, function(tp) rownames(sig[[tp]]$down))),
+  both = Reduce(intersect, lapply(timepoints, function(tp) rownames(sig[[tp]]$both)))
+)
+
+# Per-contrast logFC/adj.P.Val for the shared gene set, with contrast-specific column
+# names built directly from the topTables (which are already indexed by gene ID) --
+# no merging required, and no suffix collisions to untangle afterward.
+build_stats_summary <- function(gene_ids) {
+  stats_by_tp <- lapply(timepoints, function(tp) {
+    df <- toptables[[tp]][gene_ids, c("logFC", "adj.P.Val")]
+    colnames(df) <- paste0(c("logFC_", "adjP_"), tp)
+    df
+  })
+  do.call(cbind, stats_by_tp)
+}
+
+stats_summary_all  <- build_stats_summary(shared_ids$all)
+stats_summary_both <- build_stats_summary(shared_ids$both)
+```
+
+## Cleaning the shared-gene matrices and building supplemental heatmaps
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+zscore_matrix_all  <- as.matrix(CPMzt[shared_ids$all, ])
+zscore_matrix_both <- as.matrix(CPMzt[shared_ids$both, ])
+
+write.csv(cbind(stats_summary_all, zscore_matrix_all),
+          file = paste0(analysis_date, "_Calbicans_5contrasts_sharedsigDE_FDR0.05.csv"))
+write.csv(cbind(stats_summary_both, zscore_matrix_both),
+          file = paste0(analysis_date, "_Calbicans_5contrasts_sharedsigDE_LogFC1_FDR0.05.csv"))
+
+mycolz <- colorRamp2(c(-1.0, 0, 1.0), c("purple", "white", "dark cyan"))
+
+# make.unique() guards against duplicate gene IDs (e.g. multi-mapped annotations)
+# breaking ComplexHeatmap's row labeling
+rownames(zscore_matrix_all)  <- make.unique(rownames(zscore_matrix_all))
+rownames(zscore_matrix_both) <- make.unique(rownames(zscore_matrix_both))
+
+hm_all <- Heatmap(zscore_matrix_all, name = "Z-score", col = mycolz,
+                   column_names_gp = gpar(fontsize = 8), cluster_columns = FALSE, cluster_rows = TRUE)
+hm_both <- Heatmap(zscore_matrix_both, name = "Z-score", col = mycolz,
+                    column_names_gp = gpar(fontsize = 8), cluster_columns = FALSE, cluster_rows = TRUE)
+
+hm_all
+hm_both
+
+pdf(paste0(analysis_date, "_Calbicans_sharedsigDE_heatmap_all.pdf"), width = 8, height = 10)
+draw(hm_all)
+dev.off()
+
+pdf(paste0(analysis_date, "_Calbicans_sharedsigDE_heatmap_LogFC1.pdf"), width = 8, height = 10)
+draw(hm_both)
+dev.off()
+```
+
+*Note: the original script wrote these z-score matrices to a `.txt` file and immediately re-read them back in with `read.delim()` before plotting, apparently to force the values to be treated as numeric. That round trip through disk isn't needed -- `as.matrix()` on the already-numeric CPM z-scores above accomplishes the same thing directly in memory.*
+
+## Verifying the statistical significance of dd_smed_v6_2394_0_1 at each timepoint
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+gene_id <- "dd_smed_v6_2394_0_1"
+
+# Was it in the raw counts, and did it survive the low-count filter?
+# (these are the same regardless of timepoint, so only need to check once)
+grep(gene_id, rownames(countsmat), ignore.case = TRUE, value = TRUE)
+grep(gene_id, rownames(dge_list), ignore.case = TRUE, value = TRUE)
+
+# Stats and FDR 0.05 significance for this gene across every timepoint vs Control
+gene_report <- lapply(timepoints, function(tp) {
+  match_id <- grep(gene_id, rownames(toptables[[tp]]), ignore.case = TRUE, value = TRUE)
+
+  if (length(match_id) == 0) {
+    return(data.frame(timepoint = tp, gene_id = NA, logFC = NA,
+                       adj.P.Val = NA, significant_FDR0.05 = NA))
+  }
+  if (length(match_id) > 1) {
+    warning(tp, ": multiple gene IDs matched -- check for near-duplicate IDs: ",
+            paste(match_id, collapse = ", "))
+  }
+
+  stats <- toptables[[tp]][match_id[1], c("logFC", "adj.P.Val")]
+  data.frame(
+    timepoint = tp,
+    gene_id = match_id[1],
+    logFC = stats$logFC,
+    adj.P.Val = stats$adj.P.Val,
+    significant_FDR0.05 = stats$adj.P.Val < 0.05
+  )
+})
+
+gene_report <- do.call(rbind, gene_report)
+gene_report
+```
+## Creating the venn diagram 
+
+```{r, warning=FALSE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+dt <- decideTests(vfit, p.value = 0.05, lfc = 1)
+summary(dt)
+
+venn_pdf <- paste0(analysis_date, "_Calbicans_VennDiagram_6hpitoDay7.pdf")
+
+venn_plot_args <- list(
+  dt,
+  include = c("up", "down"),
+  counts.col = c("dark cyan", "purple"),
+  circle.col = c("red", "blue", "green3", "magenta", "black"),
+  mar = rep(1, 4),
+  cex = c(1.5, 1.2, 0.5)
+)
+
+pdf(file = venn_pdf)
+do.call(vennDiagram, venn_plot_args)
+dev.off()
+
+# Also draw it inline so it shows up in the knitted document / plot pane
+do.call(vennDiagram, venn_plot_args)
+```
