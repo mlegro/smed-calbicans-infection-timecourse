@@ -1,0 +1,35 @@
+# --- Raw sequencing data ---
+# Never commit raw reads -- these belong on SRA, not in git history.
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+
+# --- Alignment output ---
+*.bam
+*.bai
+*.sam
+*.summary
+
+# --- Reference genome / index ---
+# The genome FASTA and the Rsubread index files built from it (reference_index.*)
+# are large and shared across projects -- keep them out of any single project's repo.
+*.fasta
+*.fa
+*.fai
+reference_index.*
+
+# Uncomment these if your GTF/GFF3 annotation files are large; leave commented
+# if you'd rather keep a small annotation file versioned alongside your code.
+# *.gtf
+# *.gff3
+
+# --- R session/project files ---
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+
+# --- OS junk files ---
+.DS_Store
+Thumbs.db
